@@ -3,7 +3,7 @@ name: Inji Certify CD - Docker Hub
 
 on:
   workflow_run:
-    workflows: ["REPLACE_WITH_EXISTING_CI_WORKFLOW_NAME"]
+    workflows: ["Maven Package upon a push"]
     types:
       - completed
     branches:
