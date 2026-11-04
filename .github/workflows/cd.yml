@@ -1,28 +1,69 @@
-name: Inji Certify CD
+
+name: Inji Certify CD - Docker Hub
 
 on:
   workflow_run:
-    workflows: ["Existing CI Workflow Name"]
+    workflows: ["REPLACE_WITH_EXISTING_CI_WORKFLOW_NAME"]
     types:
       - completed
     branches:
       - CD-Pipeline
 
+permissions:
+  contents: read
+
 jobs:
-  build-image:
-    if: github.event.workflow_run.conclusion == 'success'
+  docker-build-push:
+    name: Build and Push Both Images
     runs-on: ubuntu-latest
 
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
     steps:
-      - name: Checkout source
+      - name: Checkout successful CI commit
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Build Docker image
-        run: |
-          docker build -t inji-certify:local .
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
 
-      - name: Verify Docker image
+      - name: Build Maven packages
         run: |
-          docker images inji-certify:local
+          chmod +x mvnw
+          ./mvnw -DskipTests package
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push base service
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: certify-service/Dockerfile
+          push: true
+          tags: |
+            sjkarthik/inji-certify:CD-Pipeline
+            sjkarthik/inji-certify:${{ github.event.workflow_run.head_sha }}
+
+      - name: Build and push service with plugins
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: certify-service-with-plugins/Dockerfile
+          push: true
+          tags: |
+            sjkarthik/inji-certify-with-plugins:CD-Pipeline
+            sjkarthik/inji-certify-with-plugins:${{ github.event.workflow_run.head_sha }}
