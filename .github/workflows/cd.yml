@@ -1,0 +1,28 @@
+name: Inji Certify CD
+
+on:
+  workflow_run:
+    workflows: ["Existing CI Workflow Name"]
+    types:
+      - completed
+    branches:
+      - CD-Pipeline
+
+jobs:
+  build-image:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t inji-certify:local .
+
+      - name: Verify Docker image
+        run: |
+          docker images inji-certify:local
