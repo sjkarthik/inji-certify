@@ -1,9 +1,10 @@
 
-name: Inji Certify CD - Docker Hub
+name: Inji Certify CI-CD - RKE2
 
 on:
   workflow_run:
-    workflows: ["Maven Package upon a push"]
+    workflows:
+      - Maven Package upon a push
     types:
       - completed
     branches:
@@ -12,13 +13,23 @@ on:
 permissions:
   contents: read
 
+# Prevent two deployments from running simultaneously.
+concurrency:
+  group: inji-certify-rke2-cd
+  cancel-in-progress: false
+
 jobs:
+
+  # --------------------------------------------------
+  # JOB 1: Build and push Docker images
+  # --------------------------------------------------
   docker-build-push:
-    name: Build and Push Both Images
+    name: Build and Push Docker Images
     runs-on: ubuntu-latest
 
     if: >
       github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'CD-Pipeline' &&
       github.event.workflow_run.head_repository.full_name == github.repository
 
     steps:
@@ -27,7 +38,7 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Set up Java
+      - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -48,7 +59,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push base service
+      # Build and push base service
+      - name: Build and Push Base Image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,7 +70,8 @@ jobs:
             sjkarthik/inji-certify:CD-Pipeline
             sjkarthik/inji-certify:${{ github.event.workflow_run.head_sha }}
 
-      - name: Build and push service with plugins
+      # Build and push plugins service
+      - name: Build and Push Plugins Image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -67,3 +80,130 @@ jobs:
           tags: |
             sjkarthik/inji-certify-with-plugins:CD-Pipeline
             sjkarthik/inji-certify-with-plugins:${{ github.event.workflow_run.head_sha }}
+
+  # --------------------------------------------------
+  # JOB 2: Deploy image to RKE2 using Helm
+  # --------------------------------------------------
+  deploy-to-rke2:
+    name: Deploy Inji Certify to RKE2
+    runs-on: [self-hosted, linux, rke2-deploy]
+
+    needs:
+      - docker-build-push
+
+    environment: inji-certify-dev
+
+    if: needs.docker-build-push.result == 'success'
+
+    env:
+      RELEASE_NAME: inji-certify
+      NAMESPACE: inji-certify
+      CHART_VERSION: 0.14.0
+      IMAGE_REPOSITORY: sjkarthik/inji-certify-with-plugins
+      IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Checkout successful CI commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Configure kubeconfig securely from GitHub secret
+      - name: Configure RKE2 access
+        shell: bash
+        env:
+          RKE2_KUBECONFIG: ${{ secrets.RKE2_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/kube"
+          printf '%s' "$RKE2_KUBECONFIG" \
+            > "$RUNNER_TEMP/kube/config"
+
+          chmod 600 "$RUNNER_TEMP/kube/config"
+
+          echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+
+      # Verify cluster connectivity
+      - name: Verify RKE2 cluster
+        run: |
+          set -euo pipefail
+
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get namespace "$NAMESPACE"
+
+      # Verify Helm is installed
+      - name: Verify Helm
+        run: |
+          helm version
+          helm list -n "$NAMESPACE"
+
+      # Deploy the new image using the existing Helm release
+      - name: Upgrade Inji Certify using Helm
+        run: |
+          set -euo pipefail
+
+          helm repo add inji https://inji.github.io/helm
+          helm repo update
+
+          helm upgrade --install "$RELEASE_NAME" inji/inji-certify \
+            --namespace "$NAMESPACE" \
+            --version "$CHART_VERSION" \
+            --reuse-values \
+            --set-string image.registry=docker.io \
+            --set-string image.repository="$IMAGE_REPOSITORY" \
+            --set-string image.tag="$IMAGE_TAG" \
+            --set-string image.pullPolicy=Always \
+            --wait \
+            --atomic \
+            --timeout 10m
+
+      # Verify that Kubernetes has completed the rollout
+      - name: Verify Kubernetes rollout
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT=$(kubectl get deployments \
+            -n "$NAMESPACE" \
+            -l "app.kubernetes.io/instance=$RELEASE_NAME" \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          if [ -z "$DEPLOYMENT" ]; then
+            echo "ERROR: Inji Certify deployment not found"
+            exit 1
+          fi
+
+          echo "Deployment: $DEPLOYMENT"
+
+          kubectl rollout status deployment/"$DEPLOYMENT" \
+            -n "$NAMESPACE" \
+            --timeout=10m
+
+          echo "Expected image: $IMAGE_REPOSITORY:$IMAGE_TAG"
+
+          kubectl get deployment "$DEPLOYMENT" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[*].image}'
+
+          echo ""
+          kubectl get pods -n "$NAMESPACE" -o wide
+
+      # Print application logs if deployment fails
+      - name: Collect deployment diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+
+          kubectl get events \
+            -n "$NAMESPACE" \
+            --sort-by='.lastTimestamp' | tail -40 || true
+
+          kubectl describe deployments \
+            -n "$NAMESPACE" || true
+
+      # Remove temporary kubeconfig
+      - name: Cleanup kubeconfig
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kube/config"
