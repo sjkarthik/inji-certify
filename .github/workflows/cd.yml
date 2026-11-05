@@ -1,0 +1,234 @@
+
+name: Inji Certify CD
+
+on:
+  push:
+    branches:
+      - CD-Pipeline
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inji-certify-rke2-deployment
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_USERNAME: sjkarthik
+  IMAGE_NAME: inji-certify
+  PLUGINS_IMAGE_NAME: inji-certify-with-plugins
+  NAMESPACE: inji-certify
+  DEPLOYMENT_NAME: inji-certify
+  CONTAINER_NAME: inji-certify
+
+jobs:
+
+  # --------------------------------------------------
+  # BUILD AND PUSH DOCKER IMAGES
+  # --------------------------------------------------
+
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+
+    if: github.ref == 'refs/heads/CD-Pipeline'
+
+    outputs:
+      image_tag: ${{ github.sha }}
+
+    steps:
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build Maven Package
+        run: |
+          chmod +x ./mvnw
+          ./mvnw -DskipTests package
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build and push Inji Certify base image
+
+      - name: Build and Push Inji Certify Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./certify-service
+          file: ./certify-service/Dockerfile
+          push: true
+          tags: |
+            sjkarthik/inji-certify:${{ github.sha }}
+            sjkarthik/inji-certify:CD-Pipeline
+
+      # Build and push Inji Certify plugins image
+
+      - name: Build and Push Inji Certify Plugins Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./certify-service-with-plugins
+          file: ./certify-service-with-plugins/Dockerfile
+          push: true
+          tags: |
+            sjkarthik/inji-certify-with-plugins:${{ github.sha }}
+            sjkarthik/inji-certify-with-plugins:CD-Pipeline
+
+  # --------------------------------------------------
+  # DEPLOY TO RKE2 CLUSTER
+  # --------------------------------------------------
+
+  deploy:
+    name: Deploy Inji Certify to RKE2
+
+    runs-on:
+      - self-hosted
+      - linux
+      - rke2-deploy
+
+    needs:
+      - build-and-push
+
+    if: github.ref == 'refs/heads/CD-Pipeline'
+
+    environment:
+      name: inji-certify-dev
+
+    steps:
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Configure Kubernetes Access
+        shell: bash
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.RKE2_KUBECONFIG }}
+        run: |
+          set -e
+
+          mkdir -p "$RUNNER_TEMP/kube"
+
+          echo "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kube/config"
+
+          chmod 600 "$RUNNER_TEMP/kube/config"
+
+          echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+
+      - name: Verify RKE2 Cluster Connection
+        run: |
+          set -e
+
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Verify Deployment and Container
+        run: |
+          set -e
+
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE"
+
+          echo "Available containers and images:"
+
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" | "}{.image}{"\n"}{end}'
+
+      # --------------------------------------------------
+      # UPDATE IMAGE USING KUBECTL
+      # --------------------------------------------------
+
+      - name: Deploy New Inji Certify Plugins Image
+        shell: bash
+        run: |
+          set -e
+
+          NEW_IMAGE="docker.io/sjkarthik/inji-certify-with-plugins:${{ needs.build-and-push.outputs.image_tag }}"
+
+          echo "New image: $NEW_IMAGE"
+
+          OLD_IMAGE=$(kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER_NAME')].image}")
+
+          if [ -z "$OLD_IMAGE" ]; then
+            echo "ERROR: Container $CONTAINER_NAME not found."
+            exit 1
+          fi
+
+          echo "Previous image: $OLD_IMAGE"
+
+          echo "Updating Kubernetes deployment..."
+
+          kubectl set image deployment/"$DEPLOYMENT_NAME" \
+            "$CONTAINER_NAME=$NEW_IMAGE" \
+            -n "$NAMESPACE"
+
+          echo "Waiting for rollout..."
+
+          if kubectl rollout status deployment/"$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            --timeout=600s; then
+
+            echo "Deployment completed successfully."
+
+          else
+
+            echo "Deployment failed. Restoring previous image..."
+
+            kubectl set image deployment/"$DEPLOYMENT_NAME" \
+              "$CONTAINER_NAME=$OLD_IMAGE" \
+              -n "$NAMESPACE"
+
+            kubectl rollout status deployment/"$DEPLOYMENT_NAME" \
+              -n "$NAMESPACE" \
+              --timeout=600s || true
+
+            echo "Deployment details:"
+            kubectl describe deployment "$DEPLOYMENT_NAME" \
+              -n "$NAMESPACE"
+
+            echo "Pod status:"
+            kubectl get pods -n "$NAMESPACE" -o wide
+
+            exit 1
+          fi
+
+      - name: Verify Final Deployment
+        if: success()
+        run: |
+          echo "Final deployment status:"
+
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE"
+
+          kubectl get pods -n "$NAMESPACE" -o wide
+
+          echo "Deployed image:"
+
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" | "}{.image}{"\n"}{end}'
+
+      - name: Cleanup Kubernetes Credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kube/config"
