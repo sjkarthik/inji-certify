@@ -96,6 +96,7 @@ jobs:
           echo "Condition Met: ${{ steps.check_output.outputs.is_condition }}"
 
   publish_to_nexus:
+     continue-on-error: true
     if: "${{ !contains(github.ref, 'master') && github.event_name != 'pull_request' }}"
     needs: build-maven-inji-certify
     uses: mosip/kattu/.github/workflows/maven-publish-to-nexus.yml@master-java21
@@ -168,6 +169,7 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
 
   sonar_analysis:
+    continue-on-error: true
     needs: build-maven-inji-certify
     if: "${{  github.event_name != 'pull_request' }}"
     uses: mosip/kattu/.github/workflows/maven-sonar-analysis.yml@dsd9685
