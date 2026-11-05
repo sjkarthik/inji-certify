@@ -51,11 +51,22 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-
+        
       - name: Build Maven Package
         run: |
+          echo "Building Inji Certify application..."
           mvn --version
           mvn -B -DskipTests clean package
+
+          echo "Building Inji Certify plugins..."
+          mvn -B -f certify-service-with-plugins/pom.xml -DskipTests clean package
+
+          echo "Verifying application JAR..."
+          ls -lh certify-service/target/*.jar
+
+          echo "Verifying plugin JARs..."
+          ls -lh certify-service-with-plugins/target/*.jar
+
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
