@@ -1,13 +1,11 @@
 name: Inji Certify CD
 
 on:
-  workflow_run:
-    workflows:
-      - "Maven Package upon a push"
-    types:
-      - completed
+  push:
     branches:
       - CD-Pipeline
+
+  workflow_dispatch:
 
 permissions:
   contents: read
