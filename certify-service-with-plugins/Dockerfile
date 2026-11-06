@@ -1,4 +1,4 @@
-FROM injistack/inji-certify:0.13.0
+FROM mosipid/inji-certify:0.13.0
 
 ARG SOURCE
 ARG COMMIT_HASH
