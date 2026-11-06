@@ -1,0 +1,156 @@
+name: Inji Certify CI-CD (v0.13.0)
+
+on:
+  push:
+    branches:
+      - CD-Pipeline_new
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inji-certify-cd-pipeline-new
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAMESPACE: sjkarthik
+  NAMESPACE: inji-certify
+  DEPLOYMENT_NAME: inji-certify
+  CONTAINER_NAME: inji-certify
+
+jobs:
+  build-test-and-push:
+    name: Build, Test and Push Images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and test Inji Certify v0.13.0
+        run: |
+          set -e
+          mvn --version
+          mvn -B clean package
+
+      - name: Build plugin artifacts v0.5.0
+        run: |
+          set -e
+          mvn -B -f certify-service-with-plugins/pom.xml clean package
+          echo "Application artifacts:"
+          ls -lh certify-service/target/*.jar
+          echo "Plugin artifacts:"
+          ls -lh certify-service-with-plugins/target/*.jar
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Inji Certify base image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./certify-service
+          file: ./certify-service/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}/inji-certify:${{ github.sha }}
+            ${{ env.IMAGE_NAMESPACE }}/inji-certify:CD-Pipeline_new
+
+      - name: Build and push Inji Certify plugins image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./certify-service-with-plugins
+          file: ./certify-service-with-plugins/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}/inji-certify-with-plugins:${{ github.sha }}
+            ${{ env.IMAGE_NAMESPACE }}/inji-certify-with-plugins:CD-Pipeline_new
+
+  deploy:
+    name: Deploy to NIRA RKE2
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - rke2-deploy
+    needs: build-test-and-push
+    environment:
+      name: inji-certify-dev
+
+    steps:
+      - name: Configure Kubernetes access
+        shell: bash
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.RKE2_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          test -n "$KUBECONFIG_CONTENT"
+          mkdir -p "$RUNNER_TEMP/kube"
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kube/config"
+          chmod 600 "$RUNNER_TEMP/kube/config"
+          echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+
+      - name: Verify cluster and target deployment
+        run: |
+          set -euo pipefail
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"
+          kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"             -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" | "}{.image}{"\n"}{end}'
+
+      - name: Deploy plugins image using kubectl set image
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.build-test-and-push.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          NEW_IMAGE="docker.io/$IMAGE_NAMESPACE/inji-certify-with-plugins:$IMAGE_TAG"
+
+          OLD_IMAGE="$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"             -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER_NAME')].image}")"
+
+          if [ -z "$OLD_IMAGE" ]; then
+            echo "ERROR: Container $CONTAINER_NAME was not found in deployment $DEPLOYMENT_NAME."
+            exit 1
+          fi
+
+          echo "Previous image: $OLD_IMAGE"
+          echo "New image: $NEW_IMAGE"
+
+          kubectl set image "deployment/$DEPLOYMENT_NAME"             "$CONTAINER_NAME=$NEW_IMAGE" -n "$NAMESPACE"
+
+          if kubectl rollout status "deployment/$DEPLOYMENT_NAME"             -n "$NAMESPACE" --timeout=600s; then
+            echo "Deployment rollout completed."
+          else
+            echo "Rollout failed. Rolling back to the previous image: $OLD_IMAGE"
+            kubectl set image "deployment/$DEPLOYMENT_NAME"               "$CONTAINER_NAME=$OLD_IMAGE" -n "$NAMESPACE"
+            kubectl rollout status "deployment/$DEPLOYMENT_NAME"               -n "$NAMESPACE" --timeout=600s || true
+            kubectl describe deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"
+            kubectl get pods -n "$NAMESPACE" -o wide
+            exit 1
+          fi
+
+      - name: Verify deployed image
+        if: success()
+        run: |
+          kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE" -o wide
+          kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"             -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" | "}{.image}{"\n"}{end}'
+
+      - name: Remove temporary kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kube/config"
