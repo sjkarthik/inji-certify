@@ -21,6 +21,7 @@ on:
       - MOSIP*
       - release*
       - INJICERT-*
+      - CD-Pipeline_new
 
 jobs:
   build-maven-inji-certify:
